@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GANSHA · X Mutual Radar
 // @namespace    http://tampermonkey.net/
-// @version      6.5
-// @description  [GANSHA 6.5] X 互關雷達（@todaygansha）：高亮未回關/未回跟帳號 + 首次發現日期追蹤 + 列表排序（未互關排最前）。v6.5：拉黑(封鎖)校正——偵測封鎖動作，確認對方從列表消失後自統計剔除，修「只增不減」累計下封鎖不扣數的失真。v6.4：following 未回關紅框統一為實線；頁腳品牌加 𝕏。v6.3：followers 未回跟紅框。v6.2：檔名英文化；全中文顯示；下拉載入空白收緊「頂部才重排」判定。v6.0：GANSHA RADAR LOGO。
+// @version      6.9
+// @description  [GANSHA 6.9] X 互關雷達（@todaygansha）：高亮未回關/未回跟帳號 + 首次發現日期追蹤 + 列表排序（未互關排最前）+ 取關偵測。v6.9：新增「這是誰的列表」判斷——逛別人的 /followers 找人關注時，改用完全不同的口徑：不再出現「未回跟」與紅框（那些人本來就不是你的粉絲），只標綠色「關注了你」（值得你回關）／「已追蹤」（別重複點）／「互關」，沒追你也沒被你追的一律不標；面板改顯示「關注你 N · 總共 M · 已追蹤 K · 他人列表」，排序把「關注了你」的人排最前。自己的列表行為完全不變。v6.8：自己的 followers 頁排除 X 插入的推薦／建議帳號（灰標「推薦 · 非粉絲」，不計入、排最後）。v6.7：followers 已回跟誤判修正＋紅框改 outline（不撐高列）＋點擊跟隨後凍結排序 8 秒。v6.6：本地增量比對「誰偷偷取關你」——狀態 1→0 且持續 30 分鐘才確認，標「剛取關你／曾取關 · M/D」；面板顯示筆數，點一下複製本地名單。資料只存自己的 localStorage，不公開、不上傳、不自動動作。v6.5：封鎖校正。v6.4：𝕏 品牌。v6.3：followers 未回跟紅框。v6.2：全中文顯示。v6.0：GANSHA RADAR LOGO。
 // @author       You
 // @match        *://x.com/*
 // @match        *://twitter.com/*
@@ -22,7 +22,22 @@
         notBack: '未回跟',
         mutual: '互關',
         total: '總共',
-        backed: '已回跟'
+        backed: '已回跟',
+        // v6.8 推薦／建議帳號（非粉絲，排除用；只在「自己的」跟隨者頁生效）
+        suggest: '推薦 · 非粉絲',
+        excluded: '已排除推薦',
+        // v6.9 別人的列表：改用「他追不追你」的口徑
+        followsYou: '關注你',
+        followsYouTag: '關注了你',
+        trackedByMe: '已追蹤',
+        othersList: '他人列表',
+        // v6.6 取關偵測
+        unfNew: '剛取關你',
+        unfPast: '曾取關',
+        unfLabel: '取關',
+        unfCopy: '點此複製名單',
+        unfCopied: '已複製',
+        unfEmpty: '尚無紀錄'
     };
 
     // ---------- 「對方回關了我」的關鍵詞（包含匹配，兼容多語言變體） ----------
@@ -70,6 +85,91 @@
         return i18n.tracked + ' ' + n + ' ' + i18n.dayUnit;
     }
 
+    // ================= v6.6 取關偵測（本地、增量、寬限確認） =================
+    // 原理：每次掃到某人就記下「他當時有沒有追你」；下次再掃到時比對。
+    //   上次 = 有追你(1) → 這次 = 沒追你(0)，且 0 的狀態持續超過寬限期 → 判定「被取關」。
+    // 為什麼要寬限期：X 的「跟隨你」指示器是分批渲染的，剛載入時常暫時讀不到，
+    //   若當下就判定會大量誤判。設 30 分鐘寬限 → DOM 載完會自動回到 1，誤判自動消失。
+    // 合規：資料全部存在自己的瀏覽器 localStorage，不公開、不上傳、不標記他人。
+    const MSTATE_KEY = 'xufr_mstate_v1';   // username -> {s:0|1, z:首次觀測到0的時間, t:最後觀測}
+    const UNF_KEY = 'xufr_unf_v1';         // username -> 'YYYY-MM-DD'（確認被取關的日期）
+    const GRACE_MS = 30 * 60 * 1000;       // 寬限 30 分鐘
+
+    let mstate = loadMState();
+    let unfLog = loadUnfLog();
+    let mstateDirty = false;
+
+    function loadMState() {
+        try { return JSON.parse(localStorage.getItem(MSTATE_KEY) || '{}'); }
+        catch (e) { return {}; }
+    }
+    function loadUnfLog() {
+        try { return JSON.parse(localStorage.getItem(UNF_KEY) || '{}'); }
+        catch (e) { return {}; }
+    }
+    function flushMState() {
+        if (!mstateDirty) return;
+        try { localStorage.setItem(MSTATE_KEY, JSON.stringify(mstate)); } catch (e) {}
+        mstateDirty = false;
+    }
+    function saveUnfLog() {
+        try { localStorage.setItem(UNF_KEY, JSON.stringify(unfLog)); } catch (e) {}
+    }
+
+    // 回傳：'new' = 本次剛確認被取關；'past' = 之前就記過；null = 無事件
+    function detectUnfollow(username, followedBy) {
+        const now = Date.now();
+        const prev = mstate[username];
+        let result = null;
+
+        if (followedBy) {
+            // 現在有追你 → 記下「曾經追過我」基準(h=1)，並清空「觀測到 0」的計時
+            if (!prev || prev.s !== 1 || prev.z || prev.h !== 1) {
+                mstate[username] = { h: 1, s: 1, z: 0, t: now };
+            } else {
+                prev.t = now;
+            }
+            mstateDirty = true;
+        } else {
+            // h 必須保留（不能被 s=0 覆寫）：它是「他是否曾追過我」的唯一基準
+            const hadFollowed = (prev && prev.h) ? prev.h : 0;
+            const zeroSince = (prev && prev.z) ? prev.z : now;
+            mstate[username] = { h: hadFollowed, s: 0, z: zeroSince, t: now };
+            mstateDirty = true;
+
+            // 兩個條件都成立才判定：曾明確觀測到他追你 ＋ 0 的狀態持續超過寬限
+            if (hadFollowed === 1 && (now - zeroSince) >= GRACE_MS) {
+                const existed = !!unfLog[username];
+                const today = todayStr();
+                if (!existed || unfLog[username] !== today) {
+                    unfLog[username] = today;   // 反覆取關者更新為最近一次日期
+                    saveUnfLog();
+                }
+                result = existed ? 'past' : 'new';
+            }
+        }
+        return result;
+    }
+
+    function unfCount() { return Object.keys(unfLog).length; }
+
+    // 匯出：純本地名單，複製到剪貼簿（自己保存用，不公開、不上傳）
+    function exportUnfollowers() {
+        const keys = Object.keys(unfLog).sort((a, b) => (unfLog[a] < unfLog[b] ? 1 : -1));
+        if (!keys.length) return i18n.unfEmpty;
+        const lines = keys.map(u => '@' + u + '  ' + unfLog[u]);
+        const txt = 'GANSHA 取關紀錄 ' + todayStr() + '（共 ' + keys.length + '）\n' + lines.join('\n');
+        try {
+            if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt);
+        } catch (e) {}
+        try { console.log(txt); } catch (e) {}
+        return txt;
+    }
+    window.__ganshaExportUnfollowers = exportUnfollowers;
+
+    // 每 60 秒落盤一次狀態（避免每次掃描都寫 localStorage）
+    setInterval(flushMState, 60000);
+
     // ---------- 統計面板 ----------
     let lastKey = '';
     let statsPanel = null;
@@ -99,8 +199,24 @@
             '</div>' +
             '<div style="margin-top:5px">' + (label || i18n.found) + ': <b style="font-size:15px">' + count + '</b></div>' +
             (diag ? '<div style="opacity:.7;font-size:11px;margin-top:2px">' + diag + '</div>' : '') +
+            '<div id="gansha-unf-line" style="opacity:.85;font-size:11px;margin-top:3px;pointer-events:auto;cursor:pointer;text-decoration:underline dotted">' +
+            i18n.unfLabel + ': <b>' + unfCount() + '</b> · ' + i18n.unfCopy + '</div>' +
             '<div style="opacity:.45;font-size:10px;margin-top:5px;padding-top:3px;border-top:1px solid rgba(255,255,255,.18)">' +
-            i18n.brandTag + ' · v6.5</div>';
+            i18n.brandTag + ' · v6.8</div>';
+
+        // 點擊取關統計行 → 複製本地名單（自己保存用；不公開、不上傳）
+        if (!statsPanel.dataset.unfBound) {
+            statsPanel.dataset.unfBound = '1';
+            statsPanel.addEventListener('click', (ev) => {
+                const t = ev.target;
+                if (!t || t.id !== 'gansha-unf-line') return;
+                const out = exportUnfollowers();
+                t.textContent = (out === i18n.unfEmpty)
+                    ? i18n.unfEmpty
+                    : i18n.unfCopied + ' · ' + unfCount() + ' 筆';
+                setTimeout(() => { lastKey = ''; }, 1800);
+            });
+        }
     }
 
     // ---------- 不重複累計帳號（username → 0/1） ----------
@@ -110,6 +226,11 @@
     const acc = new Map();
     let accPath = '';        // 目前累計的頁面（完整 pathname）
     let accZeroStreak = 0;   // 連續幾輪「0 列可見」→ 判斷 X 清空重建
+    const sugSeen = new Set(); // v6.8：本頁已排除的推薦帳號（換頁清空）
+    // v6.9：別人列表的專用計數（不進 acc，避免污染自己的未回跟統計）
+    const othersSeen = new Set();
+    const othersFY = new Set();      // 他有追你
+    const othersTracked = new Set(); // 你已追他
 
     // 只取主欄內真正可見的 UserCell；排除右欄建議、aria-hidden 副本、彈窗
     function visibleCellsOnPage() {
@@ -126,6 +247,105 @@
         return list;
     }
 
+    // 「我已經在追蹤他」的按鈕文字（v6.7 新增）
+    // 舊版只認「跟隨/關注/Follow」開頭 → X 若渲染成「關注中／已關注／正在關注」這類變體，
+    // 會被誤判成「未回跟」而錯標紅框。這裡先攔一次「已追蹤」狀態。
+    const FOLLOWING_TXT_RE = /^(正在跟隨|跟隨中|已跟隨|正在關注|關注中|已關注|正在追隨|追隨中|已追蹤|追蹤中|Following|フォロー中|フォロー済み|Siguiendo|Suivre|Abonné)/i;
+    // 「我還沒追蹤他」的按鈕文字
+    const FOLLOW_TXT_RE = /^(跟隨|追随|关注|關注|追蹤|Follow|フォロー|Seguir|Suivre|Følg|Следить|Takip|Ikuti)/;
+
+    // ---------- v6.8：推薦／建議帳號識別（他們根本沒追你，不是粉絲） ----------
+    // X 會在 /followers 列表尾端插入「為你推薦／你可能感興趣／Who to follow」區塊，
+    // 這些人不是你的粉絲，但一樣渲染成 UserCell + 「跟隨」鈕 → 會被當成「未回跟」錯標紅框。
+    // 兩道關卡：① 只掃主列表容器（下面 mainListCells）② 文案識別兜底（這裡）。
+    const SUGGEST_TITLE_RE = /(為你推薦|为你推荐|推薦給你|推荐给你|推薦關注|推荐关注|推薦追蹤|推荐追踪|建議追蹤|建议追踪|建議關注|建议关注|建議用戶|建议用户|你可能感興趣|你可能感兴趣|你可能認識|你可能认识|你可能想追蹤|你可能想关注|你可能想關注|熱門帳號|热门账号|為你精選|为你精选|發現更多|发现更多|Who to follow|Suggested for you|Suggestions for you|You might like|Popular accounts|Discover more|Recommended)/i;
+    // 注意：這裡刻意不放 "Followed by" —— X 在一般 UserCell 上也會顯示「被誰關注」的
+    // 社交證明，放進來會把真粉絲誤判成推薦帳號（寧可漏網，不可誤排除）。
+    const SUGGEST_REASON_RE = /(你關注的人也在關注|你关注的人也关注|與你有共同追蹤|与你有共同|因為你關注|因为你关注|因為您追蹤|为你推荐|為你推薦|Based on your|Suggested for you|Promoted|贊助內容|推广)/i;
+
+    // 只查「這一列自己」的區塊標題（cell 內 + 該列的 cellInnerDiv 內）。
+    // 刻意不往上爬整頁：followers 列表與推薦模組常共用同一個容器，
+    // 往上找標題會連前面幾十個真粉絲一起誤判成推薦 → 寧可不抓，也不誤排除。
+    function nearSuggestTitle(cell) {
+        if (!cell) return false;
+        const scopes = [cell, cell.parentElement];
+        for (const n of scopes) {
+            if (!n || !n.querySelectorAll) continue;
+            let heads = null;
+            try { heads = n.querySelectorAll('[role="heading"], h2, h3, [data-testid="moduleTitle"]'); }
+            catch (e) { continue; }
+            if (!heads || !heads.length || heads.length > 3) continue;
+            for (const h of heads) {
+                const t = (h.textContent || '').trim();
+                if (t && t.length <= 40 && SUGGEST_TITLE_RE.test(t)) return true;
+            }
+        }
+        return false;
+    }
+
+    function isSuggestedEntry(cell) {
+        if (!cell) return false;
+        try {
+            const tags = cell.querySelectorAll('div, span');
+            for (const t of tags) {
+                const raw = (t.textContent || '').trim();
+                if (!raw || raw.length > 40) continue;
+                if (SUGGEST_REASON_RE.test(raw)) return true;
+                if (SUGGEST_TITLE_RE.test(raw) && raw.length <= 20) return true;
+            }
+            if (nearSuggestTitle(cell)) return true;
+        } catch (e) {}
+        return false;
+    }
+    // 供排序模組共用（兩個 IIFE 之間唯一的橋接點，純函式、無副作用）
+    try { window.__ganshaIsSuggested = isSuggestedEntry; } catch (e) {}
+
+    // ---------- v6.8：只掃「主列表容器」內的 UserCell ----------
+    // 舊版掃 primaryColumn 內所有 UserCell → 把列表尾端的推薦模組、以及其他容器的
+    // 建議用戶一起算進來（他們不是粉絲，卻被當「未回跟」）。
+    // 這裡與排序模組同源：找出「含最多 cellInnerDiv 的那個容器」，只處理它裡面的列。
+    let cachedListRoot = null;
+    function mainListCells() {
+        const primary = document.querySelector('[data-testid="primaryColumn"]') || document.body;
+        const sidebar = document.querySelector('[data-testid="sidebarColumn"]');
+        let divs = Array.from(primary.querySelectorAll('[data-testid="cellInnerDiv"]'));
+        if (sidebar) divs = divs.filter(d => !sidebar.contains(d));
+        divs = divs.filter(d => d.querySelector('[data-testid="UserCell"]'));
+        if (!divs.length) return [];
+
+        const byParent = new Map();
+        for (const d of divs) {
+            const p = d.parentElement;
+            if (!p) continue;
+            if (!byParent.has(p)) byParent.set(p, []);
+            byParent.get(p).push(d);
+        }
+        if (!byParent.size) return [];
+
+        let root = null, best = null;
+        for (const [p, list] of byParent.entries()) {
+            if (!best || list.length > best.length) { best = list; root = p; }
+        }
+        // 容器選擇要穩定：上一輪的容器若還掛著且仍有多數列，就繼續用它（避免來回跳）
+        if (cachedListRoot && cachedListRoot.isConnected) {
+            const prev = byParent.get(cachedListRoot);
+            if (prev && prev.length >= Math.max(2, (best ? best.length : 0) * 0.6)) root = cachedListRoot;
+        }
+        cachedListRoot = root || null;
+
+        const list = byParent.get(root) || divs;
+        const out = [];
+        for (const d of list) {
+            const c = d.querySelector('[data-testid="UserCell"]');
+            if (!c) continue;
+            if (c.closest('[aria-hidden="true"]')) continue;
+            if (c.closest('[role="dialog"]')) continue;
+            const r = c.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) out.push(c);
+        }
+        return out;
+    }
+
     // 跟隨者頁「你已回跟？」——只採「按鈕已渲染」的列。
     // 回傳：1 = 已回跟（取消跟隨鈕）/ 0 = 未回跟（跟隨鈕）/ null = 尚未載完，不採計
     function readBackState(cell) {
@@ -136,7 +356,12 @@
         for (const b of nodes) {
             const t = (b.textContent || '').trim();
             if (!t || t.length > 14) continue;
-            if (/^(跟隨|追随|关注|關注|Follow|フォロー|Seguir|Suivre|Følg|Следить|Takip|Ikuti)/.test(t)) return 0;
+            if (FOLLOWING_TXT_RE.test(t)) return 1;   // v6.7：已追蹤 → 不是未回跟
+        }
+        for (const b of nodes) {
+            const t = (b.textContent || '').trim();
+            if (!t || t.length > 14) continue;
+            if (FOLLOW_TXT_RE.test(t)) return 0;
         }
         return null; // 動作按鈕還沒出現 → 視為骨架，等下一輪
     }
@@ -161,8 +386,79 @@
         return IGNORED_USERNAMES.has(u) ? null : u;
     }
 
+    // ---------- v6.9：這是「誰的」列表？自己的 vs 別人的 ----------
+    // 使用者的真實用法：點進別人的跟隨者列表，看看裡面有沒有值得關注的人。
+    // 那些人本來就沒追你，若在別人頁面上照跑「未回跟 → 紅框」，整頁會被標成紅框
+    // （v6.8 報障的真正原因），而且「推薦 · 非粉絲」這種標籤在別人頁面上也毫無意義。
+    // → 別人頁面改用完全不同的口徑：只標「他有沒有追你」＋「你有沒有追過他」。
+    const MY_HANDLE_KEY = 'xufr_myhandle_v1';
+    let myHandleCache = '';
+    function myHandle() {
+        if (myHandleCache) return myHandleCache;
+        try { myHandleCache = localStorage.getItem(MY_HANDLE_KEY) || ''; } catch (e) {}
+        if (myHandleCache) return myHandleCache;
+        let h = '';
+        try {
+            // 來源 1：側欄/底欄個人頭像連結 href="/你的帳號"
+            const a = document.querySelector('[data-testid="AppTabBar_Profile_Link"]');
+            if (a) {
+                const seg = (a.getAttribute('href') || '').split('/').filter(Boolean);
+                if (seg.length) h = seg[0].toLowerCase();
+            }
+            // 來源 2：帳號切換鈕內的 @handle 文字
+            if (!h) {
+                const s = document.querySelector('[data-testid="SideNav_AccountSwitcher_Button"]');
+                if (s) {
+                    const m = /@([A-Za-z0-9_]{1,15})/.exec(s.textContent || '');
+                    if (m) h = m[1].toLowerCase();
+                }
+            }
+        } catch (e) {}
+        if (h) {
+            myHandleCache = h;
+            try { localStorage.setItem(MY_HANDLE_KEY, h); } catch (e) {}
+        }
+        return h;
+    }
+    // 網址第一段就是列表主人（/xxx/followers → xxx）
+    function pageOwner() {
+        const seg = location.pathname.split('/').filter(Boolean);
+        if (!seg.length) return null;
+        const first = seg[0].toLowerCase();
+        if (IGNORED_USERNAMES.has(first)) return null;
+        return first;
+    }
+    // 抓不到（無法判斷）時一律視為「自己的」→ 維持舊行為，不會因為抓不到就把自己頁面搞壞
+    function isOwnList() {
+        const o = pageOwner();
+        if (!o) return true;
+        const me = myHandle();
+        if (!me) return true;
+        return o === me;
+    }
+    try { window.__ganshaIsOwnList = isOwnList; } catch (e) {}
+
+    // ---------- 紅框標記（v6.7 改用 outline：不佔佈局空間，列高不變） ----------
+    let FRAME_ON = true;   // v6.9：由 scanDOM 依「是否自己的列表」切換
+    // 舊版用 border 會把列高撐高 4px，X 虛擬列表的 translateY 模型跟我們重寫的值對不上
+    // → 相鄰列邊框疊加混亂、捲動時跳動。outline 完全不影響盒模型。
+    function frameCell(cell, strong) {
+        // v6.9：紅框只畫在「自己的」列表上。逛別人的關注／跟隨者列表是為了找人，
+        // 整頁紅框沒有意義，也沒有任何需要處理的異常 → 一律不畫。
+        if (!FRAME_ON) return;
+        cell.style.outline = '2px solid #e0245e';
+        cell.style.outlineOffset = '-2px';
+        cell.style.backgroundColor = strong ? 'rgba(224, 36, 94, 0.07)' : 'rgba(224, 36, 94, 0.05)';
+        cell.style.borderRadius = '16px';
+    }
+
     // ---------- 徽章 ----------
     function appendBadge(cell, username, badge) {
+        // 同類標籤已存在就不再插（防重複疊加）
+        try {
+            const kind = badge.dataset && badge.dataset.radarTag;
+            if (kind && cell.querySelector('.x-radar-badge-cell[data-radar-tag="' + kind + '"]')) return;
+        } catch (e) {}
         const textDivs = cell.querySelectorAll('span');
         let inserted = false;
         for (let t of textDivs) {
@@ -181,17 +477,38 @@
     function makeTag(kind, days) {
         const b = document.createElement('div');
         b.className = 'x-radar-badge-cell';
+        b.dataset.radarTag = kind;
         let txt, css;
-        const base = 'font-size: 12px; font-weight: 600; padding: 2px 10px; border-radius: 999px; margin-left: 8px; display: inline-flex; white-space: nowrap;';
+        // v6.7：限高 18px、line-height 16px → 徽章不會把列撐高（列高一變，X 虛擬列表的
+        // translateY 模型就跟我們重寫的值對不上 → 邊框疊加/重疊混亂）
+        const base = 'font-size: 12px; font-weight: 600; padding: 0 10px; height: 18px; line-height: 16px; ' +
+                     'box-sizing: border-box; align-items: center; border-radius: 999px; margin-left: 8px; ' +
+                     'display: inline-flex; white-space: nowrap;';
         if (kind === 'notback') {
             txt = '未回關 · ' + fmtDays(days);
             css = 'color: #f91880; border: 1px solid #f91880; background: #fff;';
+        } else if (kind === 'unf') {
+            // 第二參數作模式用：'new' = 本次剛偵測到；其餘為日期字串（M/D）
+            txt = (days === 'new') ? i18n.unfNew : (i18n.unfPast + ' · ' + (days || ''));
+            css = 'color: #fff; border: 1px solid #e0245e; background: #e0245e;';
         } else if (kind === 'mutual') {
             txt = '互關';
             css = 'color: #00a06a; border: 1px solid #7fe0c0; background: #f0fbf6;';
         } else if (kind === 'backed') {
             txt = '已回跟';
             css = 'color: #00a06a; border: 1px solid #7fe0c0; background: #f0fbf6;';
+        } else if (kind === 'followsyou') {
+            // v6.9：在別人的列表裡，他已經追你 → 這才是值得你回關的訊號
+            txt = i18n.followsYouTag;
+            css = 'color: #00a06a; border: 1px solid #00a06a; background: #f0fbf6;';
+        } else if (kind === 'tracked') {
+            // v6.9：你已經追過他了（避免重複點）
+            txt = i18n.trackedByMe;
+            css = 'color: #00a06a; border: 1px solid #7fe0c0; background: #f0fbf6;';
+        } else if (kind === 'suggest') {
+            // v6.8：X 自己插入的推薦帳號（不是粉絲）→ 灰標，讓你知道為什麼這列沒被算進去
+            txt = i18n.suggest;
+            css = 'color: #8b98a5; border: 1px dashed #cfd9de; background: #f7f9f9;';
         } else {
             txt = '未回跟';
             css = 'color: #8b98a5; border: 1px solid #cfd9de; background: #fff;';
@@ -201,11 +518,14 @@
         return b;
     }
 
-    // 清除某格可能殘留的雷達視覺標記
+    // 清除某格可能殘留的雷達視覺標記（全部清除，不只第一個）
     function clearCellVisual(cell) {
-        const oldBadge = cell.querySelector('.x-radar-badge-cell');
-        if (oldBadge) oldBadge.remove();
-        cell.style.border = '';
+        try {
+            cell.querySelectorAll('.x-radar-badge-cell').forEach(n => n.remove());
+        } catch (e) {}
+        cell.style.outline = '';
+        cell.style.outlineOffset = '';
+        cell.style.border = '';       // 清舊版殘留
         cell.style.backgroundColor = '';
         cell.style.borderRadius = '';
     }
@@ -249,9 +569,17 @@
         if (statsPanel) statsPanel.style.display = 'block';
 
         // 換頁（含換到別人的同名清單）→ 重新累計
-        if (accPath !== p) { accPath = p; acc.clear(); accZeroStreak = 0; lastKey = ''; }
+        if (accPath !== p) {
+            accPath = p; acc.clear(); sugSeen.clear(); accZeroStreak = 0; lastKey = '';
+            othersSeen.clear(); othersFY.clear(); othersTracked.clear();
+        }
 
-        const cells = visibleCellsOnPage();
+        const ownList = isOwnList();
+        FRAME_ON = ownList;   // v6.9：別人的列表不畫紅框
+
+        // v6.8：優先只取主列表容器的列（排除推薦模組／側欄建議／彈窗）；取不到再退回全頁掃描
+        let cells = mainListCells();
+        if (!cells.length) cells = visibleCellsOnPage();
 
         // v6.5 block 校正：被拉黑的帳號 X 會把他從跟隨/跟隨者列表移除，但 acc 是「只增不減」
         // 累計（防捲動倒退），block 又不觸發整列重建 → 殘留造成數字不扣。偵測拉黑動作後，
@@ -278,21 +606,82 @@
             if (!username) return;
 
             if (isFers) {
+                // v6.9：別人的跟隨者列表 → 換一套口徑（這裡的人本來就不是你的粉絲）
+                if (!ownList) {
+                    const stO = readBackState(cell);   // 1 = 你已追他 / 0 = 你沒追他
+                    if (stO === null) return;
+                    const fb = cellFollowedBy(cell);   // 他有沒有追你（X 會顯示「關注了你」）
+                    const mode = fb
+                        ? (stO === 1 ? 'o_mutual' : 'o_fy')
+                        : (stO === 1 ? 'o_tracked' : 'o_none');
+                    const ckO = 'other_' + mode;
+                    othersSeen.add(username);
+                    if (fb) othersFY.add(username);
+                    if (stO === 1) othersTracked.add(username);
+                    if (cell.dataset.radarScanned === ckO) return;
+                    cell.dataset.radarScanned = ckO;
+                    clearCellVisual(cell);
+                    if (mode === 'o_mutual') appendBadge(cell, username, makeTag('mutual'));
+                    else if (mode === 'o_fy') appendBadge(cell, username, makeTag('followsyou'));
+                    else if (mode === 'o_tracked') appendBadge(cell, username, makeTag('tracked'));
+                    // o_none：沒追你、你也没追 → 完全不標。你就是來找這種人的，標了只是噪音。
+                    return;
+                }
+                // v6.8：推薦／建議帳號（根本沒追你）→ 不打紅框、不算未回跟、只標灰徽章
+                if (isSuggestedEntry(cell)) {
+                    sugSeen.add(username);
+                    if (cell.dataset.radarScanned === 'fers_sug') return;
+                    cell.dataset.radarScanned = 'fers_sug';
+                    clearCellVisual(cell);
+                    appendBadge(cell, username, makeTag('suggest'));
+                    return;
+                }
                 // 跟隨者頁：未回跟 = 你沒追蹤他。只採「按鈕已渲染」的列
                 const st = readBackState(cell);
                 if (st === null) return;
                 acc.set(username, st);
-                const ck = 'fers_' + st;
+
+                // v6.7 穩定確認：同一狀態需連續觀測到 2 次才上色。
+                // X 的按鈕是分批渲染的，首輪可能只看到「跟隨」鈕（其實你已回跟），
+                // 當下就上紅框會造成誤標。等一次掃描確認即可完全避免。
+                if (cell.dataset.radarStUser !== username) {
+                    cell.dataset.radarStUser = username;
+                    cell.dataset.radarSt = String(st);
+                    cell.dataset.radarStN = '1';
+                    cell.dataset.radarStTot = '1';
+                } else {
+                    const same = cell.dataset.radarSt === String(st);
+                    cell.dataset.radarSt = String(st);
+                    cell.dataset.radarStN = same ? String((+cell.dataset.radarStN || 0) + 1) : '1';
+                    cell.dataset.radarStTot = String((+cell.dataset.radarStTot || 0) + 1);
+                }
+                if ((+cell.dataset.radarStN || 0) < 2 && (+cell.dataset.radarStTot || 0) < 6) return;
+
+                // v6.6：此人若曾在跟隨中頁被偵測到「取關過我」，此頁一併標示
+                const unfDateF = unfLog[username] || null;
+                const ck = 'fers_' + st + '_' + (unfDateF || '');
                 if (cell.dataset.radarScanned === ck) return;
                 cell.dataset.radarScanned = ck;
                 clearCellVisual(cell);
+
                 if (st === 1) {
+                    // 已回跟：綠標，絕不畫紅框（紅框只保留給真正的「未回跟」）
                     appendBadge(cell, username, makeTag('backed'));
+                    if (unfDateF) {
+                        const pf = unfDateF.split('-');
+                        const mdF = pf.length === 3 ? (+pf[1]) + '/' + (+pf[2]) : unfDateF;
+                        appendBadge(cell, username, makeTag('unf', mdF));
+                    }
+                    return;
+                }
+
+                // 未回跟 → 紅框圈起來（與 following 頁未回關同款視覺語言）
+                frameCell(cell, !!unfDateF);
+                if (unfDateF) {
+                    const pf = unfDateF.split('-');
+                    const mdF = pf.length === 3 ? (+pf[1]) + '/' + (+pf[2]) : unfDateF;
+                    appendBadge(cell, username, makeTag('unf', mdF));
                 } else {
-                    // 未回跟 → 紅框圈起來（與 following 頁未回關同款視覺語言）
-                    cell.style.border = '2px solid #e0245e';
-                    cell.style.backgroundColor = 'rgba(224, 36, 94, 0.05)';
-                    cell.style.borderRadius = '16px';
                     appendBadge(cell, username, makeTag('notbacked'));
                 }
                 return;
@@ -307,14 +696,28 @@
             const isFollowedBy = cellFollowedBy(cell);
             acc.set(username, isFollowedBy ? 1 : 0);
 
-            const fullKey = username + '_' + isFollowing + '_' + isFollowedBy;
+            // v6.6 取關偵測：比對上次觀測狀態（須持續 30 分鐘才確認，避免指示器延遲渲染誤判）
+            const unfEvt = detectUnfollow(username, isFollowedBy);
+            const unfDate = unfLog[username] || null;
+
+            const fullKey = username + '_' + isFollowing + '_' + isFollowedBy + '_' + (unfDate || '');
             if (cell.dataset.radarScanned === fullKey) return; // 視覺已處理過
 
             clearCellVisual(cell);
             cell.dataset.radarScanned = fullKey;
 
+            if (isFollowedBy && store[username]) { delete store[username]; saveStore(); }
+
+            // 取關紀錄優先顯示：他追過你又跑掉，比單純「未回關」更值得注意
+            if (unfDate) {
+                frameCell(cell, true);
+                const pp = unfDate.split('-');
+                const mdTxt = pp.length === 3 ? (+pp[1]) + '/' + (+pp[2]) : unfDate;
+                appendBadge(cell, username, makeTag('unf', unfEvt === 'new' ? 'new' : mdTxt));
+                return;
+            }
+
             if (isFollowedBy) {
-                if (store[username]) { delete store[username]; saveStore(); }
                 appendBadge(cell, username, makeTag('mutual'));
                 return;
             }
@@ -323,13 +726,19 @@
                 store[username] = todayStr();
                 saveStore();
             }
-            cell.style.border = '2px solid #e0245e';
-            cell.style.backgroundColor = 'rgba(224, 36, 94, 0.05)';
-            cell.style.borderRadius = '16px';
+            frameCell(cell, false);
             appendBadge(cell, username, makeTag('notback', daysSince(store[username])));
         });
 
         // 統計：以不重複累計為準（只增不減；分類以最新狀態覆蓋）
+        // v6.9：別人的跟隨者列表 → 改以「他有沒有追你」為主統計，不看未回跟
+        if (isFers && !ownList) {
+            updateStats(i18n.followsYou, othersFY.size,
+                i18n.total + ' ' + othersSeen.size +
+                ' · ' + i18n.trackedByMe + ' ' + othersTracked.size +
+                ' · ' + i18n.othersList);
+            return;
+        }
         if (!acc.size) {
             updateStats(isFers ? i18n.notBack : i18n.found, 0, i18n.total + ' 0');
             return;
@@ -338,8 +747,9 @@
         acc.forEach(v => { if (v === 1) backed++; });
         const seen = acc.size;
         if (isFers) {
+            const ex = sugSeen.size ? ' · ' + i18n.excluded + ' ' + sugSeen.size : '';
             updateStats(i18n.notBack, seen - backed,
-                i18n.total + ' ' + seen + ' · ' + i18n.backed + ' ' + backed);
+                i18n.total + ' ' + seen + ' · ' + i18n.backed + ' ' + backed + ex);
         } else {
             updateStats(i18n.found, seen - backed,
                 i18n.total + ' ' + seen + ' · ' + i18n.mutual + ' ' + backed);
@@ -415,7 +825,8 @@
     const KW_MISS_MS = 8000;      // 未命中只短快取 8 秒（內容分批載入，稍後重掃校正）
     const SETTLE_MS = 400;        // X 連續變動後需靜止多久才允許重掛
     const REBUILD_GAP_MS = 2000;  // 兩次「重掛 DOM」最短間隔
-    const LOCK_MS = 3000;         // 重掛後的鎖定期：完全不動作
+    const LOCK_MS = 4000;         // 重掛後的鎖定期：完全不動作
+    const FREEZE_MS = 8000;       // 使用者點了跟隨/取消跟隨 → 凍結排序 8 秒（防列在手下跳走）
     const READY_RATIO = 0.6;      // 就緒率門檻（可判定的列佔比）
     const TOP_MIN_Y = 60;         // 掛載列最小 translateY ≤ 此值才視為「列表頂部」
     const TOP_MIN_Y_LOW = -80;    // 允許小幅負值 overscan
@@ -533,13 +944,36 @@
         return false;
     }
 
+    // v6.7：「我已經在追蹤他」的按鈕文字（與雷達端一致，避免把已回跟誤判成未回跟）
+    const FOLLOWING_TXT_RE = /^(正在跟隨|跟隨中|已跟隨|正在關注|關注中|已關注|正在追隨|追隨中|已追蹤|追蹤中|Following|フォロー中|フォロー済み|Siguiendo|Suivre|Abonné)/i;
+
     // 分類：回傳 'front'（未互關/未回跟，應排前）| 'back'（互關/已回跟）| null（未就緒）
     function cellClass(cell, page) {
         if (!cell) return null;
         const isFers = page.indexOf('followers:') === 0;
         if (isFers) {
             if (!rowLoadedFollowers(cell)) return null;
+            // v6.9：別人的跟隨者列表 → 排序改以「他有沒有追你」為準。
+            // 你在別人列表裡要找的是「值得關注的人」，而最值得回關的就是已經追你的人 → 排最前。
+            let own = true;
+            try {
+                if (typeof window.__ganshaIsOwnList === 'function') own = window.__ganshaIsOwnList();
+            } catch (e) {}
+            if (!own) {
+                const fm = fastMutualThem(cell);
+                if (fm !== null) return fm ? 'front' : 'back';
+                return kwMutualThem(cell) ? 'front' : 'back';
+            }
+            // v6.8：推薦／建議帳號（不是粉絲）一律排到最後，不混進「未回跟」前段
+            try {
+                if (typeof window.__ganshaIsSuggested === 'function' && window.__ganshaIsSuggested(cell)) return 'back';
+            } catch (e) {}
             if (cell.querySelector('[data-testid$="-unfollow"]')) return 'back'; // 已回跟
+            // v6.7：按鈕若渲染成「關注中／已關注」等變體（無 testid），也算已回跟
+            for (const b of cell.querySelectorAll('[role="button"]')) {
+                const t = (b.textContent || '').trim();
+                if (t && t.length <= 14 && FOLLOWING_TXT_RE.test(t)) return 'back';
+            }
             return 'front'; // 已載入且有跟隨鈕 → 未回跟
         }
         // following
@@ -583,8 +1017,10 @@
         const plan = [];
         let y = 0;
         for (const r of ordered) {
+            const h = r.offsetHeight || 0;
+            if (h <= 0) return false;   // 高度還沒量到（正在載入）→ 放棄本次重寫，避免算出錯位
             plan.push({ r: r, want: Math.round(y) });
-            y += r.offsetHeight || 0;
+            y += h;
         }
         let changed = false;
         for (const p of plan) {
@@ -609,6 +1045,11 @@
         if (now < pausedUntil) return;          // 暫停中（X 持續還原）
         if (now < lockUntil) return;            // 剛重掛完鎖定期：不動作
         if (now - lastMutAt < SETTLE_MS) return; // X 還在變動
+
+        // X 的「取消跟隨？」確認彈窗開著時絕不重排（這時搬 DOM 畫面一定跳）
+        try {
+            if (document.querySelector('[data-testid="confirmationSheetDialog"]')) return;
+        } catch (e) {}
 
         const rows = getRows();
         if (rows.length < 2) return;
@@ -678,7 +1119,7 @@
         }
         rebuildCount++;
         try {
-            console.log('[排序6.5] ' + page + ' 重排#' + rebuildCount +
+            console.log('[排序6.9] ' + page + ' 重排#' + rebuildCount +
                 ' · 列=' + rows.length + ' · 前=' + fronts.length + '/後=' + backs.length +
                 ' · 首=' + rowUser(ordered[0]) +
                 (absMode ? ' · [Y]' + (yMoved ? '已修' : '') : ' · [flow]'));
@@ -700,7 +1141,7 @@
                 schedule(cur, 500);
                 return;
             }
-            try { doSort(cur); } catch (e) { try { console.log('[排序6.5] 錯誤', e); } catch (_) {} }
+            try { doSort(cur); } catch (e) { try { console.log('[排序6.9] 錯誤', e); } catch (_) {} }
         }, delay);
     }
 
@@ -727,6 +1168,30 @@
                 if (p) schedule(p, 200);
             }, 200);
         }, { passive: true });
+
+        // v6.7：使用者點「跟隨 / 取消跟隨 / 回關」→ 凍結排序 8 秒。
+        // 舊版一按下，該列狀態變了就立刻被我們搬到後段 → 畫面在手下跳走（使用者回報的跳動）。
+        const FOLLOW_BTN_RE = /(跟隨|取消跟隨|正在跟隨|關注|取消關注|正在關注|已關注|追蹤|Follow|Following|Unfollow|フォロー)/i;
+        document.addEventListener('click', (ev) => {
+            const el = ev.target;
+            if (!el || !el.closest) return;
+            const cell = el.closest('[data-testid="UserCell"]');
+            if (!cell) return;
+            let isFollowBtn = !!el.closest('[data-testid$="-follow"], [data-testid$="-unfollow"]');
+            if (!isFollowBtn) {
+                const b = el.closest('[role="button"]');
+                if (b && b !== cell) {
+                    const t = (b.textContent || '').trim();
+                    if (t && t.length <= 14 && FOLLOW_BTN_RE.test(t)) isFollowBtn = true;
+                }
+            }
+            if (!isFollowBtn) return;
+            const now = Date.now();
+            lockUntil = now + FREEZE_MS;
+            lastRebuildAt = now;
+            lastMutAt = now;
+            try { console.log('[排序6.9] 偵測到跟隨操作 → 凍結排序 ' + (FREEZE_MS / 1000) + ' 秒'); } catch (e) {}
+        }, true);
 
         // 兜底：換頁 / observer 漏接時仍會檢查
         setInterval(() => {
