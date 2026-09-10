@@ -1,9 +1,13 @@
 // ==UserScript==
 // @name         GANSHA · X Mutual Radar
 // @namespace    http://tampermonkey.net/
-// @version      6.9
-// @description  [GANSHA 6.9] X 互關雷達（@todaygansha）：高亮未回關/未回跟帳號 + 首次發現日期追蹤 + 列表排序（未互關排最前）+ 取關偵測。v6.9：新增「這是誰的列表」判斷——逛別人的 /followers 找人關注時，改用完全不同的口徑：不再出現「未回跟」與紅框（那些人本來就不是你的粉絲），只標綠色「關注了你」（值得你回關）／「已追蹤」（別重複點）／「互關」，沒追你也沒被你追的一律不標；面板改顯示「關注你 N · 總共 M · 已追蹤 K · 他人列表」，排序把「關注了你」的人排最前。自己的列表行為完全不變。v6.8：自己的 followers 頁排除 X 插入的推薦／建議帳號（灰標「推薦 · 非粉絲」，不計入、排最後）。v6.7：followers 已回跟誤判修正＋紅框改 outline（不撐高列）＋點擊跟隨後凍結排序 8 秒。v6.6：本地增量比對「誰偷偷取關你」——狀態 1→0 且持續 30 分鐘才確認，標「剛取關你／曾取關 · M/D」；面板顯示筆數，點一下複製本地名單。資料只存自己的 localStorage，不公開、不上傳、不自動動作。v6.5：封鎖校正。v6.4：𝕏 品牌。v6.3：followers 未回跟紅框。v6.2：全中文顯示。v6.0：GANSHA RADAR LOGO。
-// @author       You
+// @version      6.10
+// @description  [GANSHA 互關雷達] X 追蹤名單增強：未回關／未回跟自動排到最前並加粉紅框、互關標綠、本地記錄誰偷偷取關你；右下角面板可點數字看完整名單。資料只存自己的瀏覽器，不公開、不上傳、不自動操作。安裝與排解見 repo 的 INSTALL.md。
+// @author       𝕏 @todaygansha
+// @updateURL    https://raw.githubusercontent.com/TODAYGANSHA/x-mutual-radar/main/GANSHA-Mutual-Radar.user.js
+// @downloadURL  https://raw.githubusercontent.com/TODAYGANSHA/x-mutual-radar/main/GANSHA-Mutual-Radar.user.js
+// @homepageURL  https://github.com/TODAYGANSHA/x-mutual-radar
+// @supportURL   https://github.com/TODAYGANSHA/x-mutual-radar/blob/main/INSTALL.md
 // @match        *://x.com/*
 // @match        *://twitter.com/*
 // @grant        none
@@ -11,6 +15,18 @@
 
 (function() {
     'use strict';
+
+    // 腳本版本：面板頁腳統一讀這裡，往後改版只要改這一行就不會漏
+    const SCRIPT_VER = '6.10';
+
+    // v6.9.1 啟動標記：一眼判斷「腳本到底有沒有被瀏覽器執行」。
+    // 在 x.com 按 F12 → Console（主控台），看到這行＝腳本在跑；
+    // 完全沒看到＝擴充權限沒開（Chrome/Edge 138+ 需在 Tampermonkey 詳情頁開啟
+    // 「允許使用者指令碼 / Allow User Scripts」，或於擴充頁開啟開發者模式）。
+    try {
+        console.log('%c[GANSHA 雷達] v' + SCRIPT_VER + ' 已載入 ✅ 正在監聽 x.com 的 /followers 與 /following 列表頁',
+            'color:#e0245e;font-weight:bold;font-size:13px');
+    } catch (e) {}
 
     // ---------- UI 文字（全中文顯示；品牌標題保留英文 GANSHA RADAR） ----------
     const i18n = {
@@ -35,9 +51,22 @@
         unfNew: '剛取關你',
         unfPast: '曾取關',
         unfLabel: '取關',
-        unfCopy: '點此複製名單',
+        unfCopy: '點此看名單',
         unfCopied: '已複製',
-        unfEmpty: '尚無紀錄'
+        unfEmpty: '尚無紀錄',
+        // v6.10 名單視窗（點面板上的數字就能看完整名單）
+        listHint: '看名單',
+        listTitleSuffix: '名單',
+        listBtnCopy: '複製名單',
+        listBtnCopied: '已複製 ✓',
+        listBtnClose: '關閉',
+        listHintTitle: '點一下看完整名單（含已監測天數）',
+        unfWatching: '還在觀察中',
+        unfTip: '本地取關偵測：記錄「曾追蹤你、後來取消」的帳號。只存在你自己的瀏覽器，不上傳、不公開。剛開始一定是 0，要累積一段時間才會有數字。',
+        unfNoteOpen: '這是「本地取關偵測」的紀錄。腳本只在你自己的跟隨者頁運作，把「曾經追蹤過你、後來取消」的人記下來。資料只存在你自己的瀏覽器裡，不上傳、不公開、也不會自動做任何事。剛開始一定是 0，要持續開著頁面、讓腳本觀察一段時間才會有數字。',
+        listNoteOwn: '這是腳本「捲過就看過」的累計名單（只增不減，不會因為你往回捲就掉數字）。數字對不上時，把列表往下多捲幾段讓它掃完。點帳號可以直接開他的主頁。',
+        listNoteOthers: '這是你在別人的列表上已經捲過的帳號。上面列出「關注了你」（值得你回關）與「你已追蹤」的人；跟你互不相干的不會列出來。',
+        listEmpty: '目前還沒有資料。把列表往下捲，讓腳本掃過帳號就會累積進來。'
     };
 
     // ---------- 「對方回關了我」的關鍵詞（包含匹配，兼容多語言變體） ----------
@@ -197,26 +226,126 @@
             '<span style="font-size:15px;font-weight:800;letter-spacing:2px;line-height:1">GANSHA</span>' +
             '<span style="font-size:9px;font-weight:700;letter-spacing:2.5px;opacity:.6;margin-left:2px;padding-top:2px">RADAR</span>' +
             '</div>' +
-            '<div style="margin-top:5px">' + (label || i18n.found) + ': <b style="font-size:15px">' + count + '</b></div>' +
+            '<div id="gansha-main-line" title="' + i18n.listHintTitle + '" style="margin-top:5px;display:flex;align-items:baseline;gap:6px;pointer-events:auto;cursor:pointer">' +
+            '<span>' + (label || i18n.found) + ': <b style="font-size:15px">' + count + '</b></span>' +
+            '<span style="opacity:.55;font-size:10px;text-decoration:underline dotted;text-underline-offset:3px">' + i18n.listHint + '</span>' +
+            '</div>' +
             (diag ? '<div style="opacity:.7;font-size:11px;margin-top:2px">' + diag + '</div>' : '') +
-            '<div id="gansha-unf-line" style="opacity:.85;font-size:11px;margin-top:3px;pointer-events:auto;cursor:pointer;text-decoration:underline dotted">' +
-            i18n.unfLabel + ': <b>' + unfCount() + '</b> · ' + i18n.unfCopy + '</div>' +
+            '<div id="gansha-unf-line" title="' + i18n.unfTip + '" style="opacity:.85;font-size:11px;margin-top:4px;pointer-events:auto;cursor:pointer;text-decoration:underline dotted;text-underline-offset:3px">' +
+            i18n.unfLabel + ': <b>' + unfCount() + '</b> · ' + (unfCount() ? i18n.unfCopy : i18n.unfWatching) + '</div>' +
             '<div style="opacity:.45;font-size:10px;margin-top:5px;padding-top:3px;border-top:1px solid rgba(255,255,255,.18)">' +
-            i18n.brandTag + ' · v6.8</div>';
+            i18n.brandTag + ' · v' + SCRIPT_VER + '</div>';
 
-        // 點擊取關統計行 → 複製本地名單（自己保存用；不公開、不上傳）
+        // v6.10：點「未回關 / 未回跟 數字」→ 開完整名單；點「取關」行 → 開取關偵測說明與名單
         if (!statsPanel.dataset.unfBound) {
             statsPanel.dataset.unfBound = '1';
             statsPanel.addEventListener('click', (ev) => {
                 const t = ev.target;
-                if (!t || t.id !== 'gansha-unf-line') return;
-                const out = exportUnfollowers();
-                t.textContent = (out === i18n.unfEmpty)
-                    ? i18n.unfEmpty
-                    : i18n.unfCopied + ' · ' + unfCount() + ' 筆';
-                setTimeout(() => { lastKey = ''; }, 1800);
+                if (!t || !t.closest) return;
+                if (t.closest('#gansha-main-line')) { openListModal(); return; }
+                if (t.closest('#gansha-unf-line')) { openUnfListModal(); return; }
             });
         }
+    }
+
+    // ---------- v6.10：名單視窗 ----------
+    // X 的列表是虛擬捲動，再怎麼滑也看不完、也數不清。這裡把腳本累計到的名單
+    // 一次攤開，可點帳號開主頁、可複製。純前端顯示，不做任何自動操作。
+    let listModal = null;
+    let listSnapshot = { title: '', note: '', rows: [], empty: '' };
+
+    function setSnapshot(title, note, rows, empty) {
+        listSnapshot = { title: title, note: note || '', rows: rows || [], empty: empty || i18n.listEmpty };
+    }
+
+    function copyToClipboard(txt) {
+        try {
+            if (navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(txt);
+        } catch (e) {}
+        try {
+            const ta = document.createElement('textarea');
+            ta.value = txt;
+            ta.style.cssText = 'position:fixed;top:-9999px;left:-9999px';
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            document.body.removeChild(ta);
+            return Promise.resolve();
+        } catch (e) { return Promise.reject(e); }
+    }
+
+    function closeListModal() { if (listModal) listModal.style.display = 'none'; }
+
+    function rowsToText(rows) {
+        return rows.map(r => '@' + r.u + (r.note ? '  ' + r.note : '')).join('\n');
+    }
+
+    function openListModal() {
+        if (!document.body) return;
+        const snap = listSnapshot;
+
+        if (!listModal) {
+            listModal = document.createElement('div');
+            listModal.style.cssText = 'position:fixed;inset:0;z-index:1000001;background:rgba(0,0,0,.55);display:none;';
+            listModal.addEventListener('click', (ev) => { if (ev.target === listModal) closeListModal(); });
+            document.body.appendChild(listModal);
+            document.addEventListener('keydown', (ev) => {
+                if (ev.key === 'Escape' && listModal && listModal.style.display === 'block') closeListModal();
+            });
+        }
+
+        const rowsHtml = snap.rows.length
+            ? snap.rows.map(r =>
+                '<a href="https://x.com/' + r.u + '" target="_blank" rel="noopener noreferrer" ' +
+                'style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:7px 2px;' +
+                'border-bottom:1px solid rgba(255,255,255,.09);color:#fff;text-decoration:none">' +
+                '<span style="font-family:monospace;font-size:13px">@' + r.u + '</span>' +
+                '<span style="opacity:.6;font-size:11px;white-space:nowrap">' + (r.note || '') + '</span></a>').join('')
+            : '<div style="opacity:.75;padding:12px 2px;line-height:1.75;font-size:12px">' + snap.empty + '</div>';
+
+        listModal.innerHTML =
+            '<div style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:min(520px,92vw);max-height:78vh;' +
+            'display:flex;flex-direction:column;background:#15202b;color:#fff;border-radius:12px;padding:16px 18px;' +
+            'font-family:monospace;box-shadow:0 12px 44px rgba(0,0,0,.55);border:1px solid rgba(255,255,255,.12)">' +
+              '<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex:0 0 auto">' +
+                '<div style="font-size:15px;font-weight:800;letter-spacing:.5px">' + snap.title + '</div>' +
+                '<div id="gansha-modal-close" style="cursor:pointer;opacity:.65;font-size:17px;line-height:1;padding:2px 7px">✕</div>' +
+              '</div>' +
+              (snap.note ? '<div style="opacity:.6;font-size:11px;margin-top:7px;line-height:1.7;flex:0 0 auto">' + snap.note + '</div>' : '') +
+              '<div style="margin-top:10px;overflow:auto;flex:1 1 auto;min-height:44px">' + rowsHtml + '</div>' +
+              '<div style="display:flex;gap:8px;margin-top:12px;justify-content:flex-end;flex:0 0 auto">' +
+                '<div id="gansha-modal-copy" style="cursor:pointer;padding:6px 13px;border:1px solid rgba(255,255,255,.3);' +
+                'border-radius:999px;font-size:12px">' + i18n.listBtnCopy + '</div>' +
+                '<div id="gansha-modal-ok" style="cursor:pointer;padding:6px 15px;background:#1d9bf0;border-radius:999px;' +
+                'font-size:12px;font-weight:700">' + i18n.listBtnClose + '</div>' +
+              '</div>' +
+            '</div>';
+        listModal.style.display = 'block';
+
+        const closeEl = listModal.querySelector('#gansha-modal-close');
+        const okEl = listModal.querySelector('#gansha-modal-ok');
+        const copyEl = listModal.querySelector('#gansha-modal-copy');
+        if (closeEl) closeEl.addEventListener('click', closeListModal);
+        if (okEl) okEl.addEventListener('click', closeListModal);
+        if (copyEl) copyEl.addEventListener('click', () => {
+            if (!snap.rows.length) { copyEl.textContent = i18n.unfEmpty; return; }
+            copyToClipboard(rowsToText(snap.rows)).then(() => {
+                copyEl.textContent = i18n.listBtnCopied;
+                setTimeout(() => { copyEl.textContent = i18n.listBtnCopy; }, 1500);
+            }).catch(() => { copyEl.textContent = i18n.unfEmpty; });
+        });
+    }
+
+    // 取關偵測名單（含說明；0 筆時把「這是什麼」講清楚，不要讓人一頭霧水）
+    function openUnfListModal() {
+        const keys = Object.keys(unfLog).sort((a, b) => (unfLog[a] < unfLog[b] ? 1 : -1));
+        setSnapshot(
+            i18n.unfLabel + i18n.listTitleSuffix + ' · ' + keys.length,
+            i18n.unfNoteOpen,
+            keys.map(u => ({ u: u, note: unfLog[u] })),
+            i18n.unfNoteOpen
+        );
+        openListModal();
     }
 
     // ---------- 不重複累計帳號（username → 0/1） ----------
@@ -733,6 +862,12 @@
         // 統計：以不重複累計為準（只增不減；分類以最新狀態覆蓋）
         // v6.9：別人的跟隨者列表 → 改以「他有沒有追你」為主統計，不看未回跟
         if (isFers && !ownList) {
+            // v6.10：同時準備可點開的名單（關注你的排前，你已追蹤的附在後）
+            const oRows = [];
+            othersFY.forEach(u => oRows.push({ u: u, note: i18n.followsYouTag }));
+            othersTracked.forEach(u => { if (!othersFY.has(u)) oRows.push({ u: u, note: i18n.trackedByMe }); });
+            setSnapshot(i18n.followsYou + i18n.listTitleSuffix + ' · ' + othersFY.size,
+                i18n.listNoteOthers, oRows, i18n.listEmpty);
             updateStats(i18n.followsYou, othersFY.size,
                 i18n.total + ' ' + othersSeen.size +
                 ' · ' + i18n.trackedByMe + ' ' + othersTracked.size +
@@ -740,17 +875,28 @@
             return;
         }
         if (!acc.size) {
+            setSnapshot((isFers ? i18n.notBack : i18n.found) + i18n.listTitleSuffix + ' · 0',
+                i18n.listNoteOwn, [], i18n.listEmpty);
             updateStats(isFers ? i18n.notBack : i18n.found, 0, i18n.total + ' 0');
             return;
         }
         let backed = 0;
         acc.forEach(v => { if (v === 1) backed++; });
         const seen = acc.size;
+        // v6.10：未回關／未回跟名單（含已監測天數，最久的排最前，與頁面上的排序一致）
+        const pendingRows = [];
+        acc.forEach((v, u) => { if (v !== 1) pendingRows.push({ u: u, d: store[u] ? daysSince(store[u]) : 0 }); });
+        pendingRows.sort((a, b) => b.d - a.d);
+        const rowsForModal = pendingRows.map(r => ({ u: r.u, note: fmtDays(r.d) }));
         if (isFers) {
             const ex = sugSeen.size ? ' · ' + i18n.excluded + ' ' + sugSeen.size : '';
+            setSnapshot(i18n.notBack + i18n.listTitleSuffix + ' · ' + pendingRows.length,
+                i18n.listNoteOwn, rowsForModal, i18n.listEmpty);
             updateStats(i18n.notBack, seen - backed,
                 i18n.total + ' ' + seen + ' · ' + i18n.backed + ' ' + backed + ex);
         } else {
+            setSnapshot(i18n.found + i18n.listTitleSuffix + ' · ' + pendingRows.length,
+                i18n.listNoteOwn, rowsForModal, i18n.listEmpty);
             updateStats(i18n.found, seen - backed,
                 i18n.total + ' ' + seen + ' · ' + i18n.mutual + ' ' + backed);
         }
