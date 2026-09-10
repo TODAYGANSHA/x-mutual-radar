@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GANSHA · X Mutual Radar
 // @namespace    http://tampermonkey.net/
-// @version      6.10
+// @version      6.11
 // @description  [GANSHA 互關雷達] X 追蹤名單增強：未回關／未回跟自動排到最前並加粉紅框、互關標綠、本地記錄誰偷偷取關你；右下角面板可點數字看完整名單。資料只存自己的瀏覽器，不公開、不上傳、不自動操作。安裝與排解見 repo 的 INSTALL.md。
 // @author       𝕏 @todaygansha
 // @updateURL    https://raw.githubusercontent.com/TODAYGANSHA/x-mutual-radar/main/GANSHA-Mutual-Radar.user.js
@@ -17,7 +17,7 @@
     'use strict';
 
     // 腳本版本：面板頁腳統一讀這裡，往後改版只要改這一行就不會漏
-    const SCRIPT_VER = '6.10';
+    const SCRIPT_VER = '6.11';
 
     // v6.9.1 啟動標記：一眼判斷「腳本到底有沒有被瀏覽器執行」。
     // 在 x.com 按 F12 → Console（主控台），看到這行＝腳本在跑；
@@ -60,11 +60,11 @@
         listBtnCopy: '複製名單',
         listBtnCopied: '已複製 ✓',
         listBtnClose: '關閉',
-        listHintTitle: '點一下看完整名單（含已監測天數）',
+        listHintTitle: '點一下看完整名單（顯示名 + 帳號 + 已監測天數）',
         unfWatching: '還在觀察中',
         unfTip: '本地取關偵測：記錄「曾追蹤你、後來取消」的帳號。只存在你自己的瀏覽器，不上傳、不公開。剛開始一定是 0，要累積一段時間才會有數字。',
         unfNoteOpen: '這是「本地取關偵測」的紀錄。腳本只在你自己的跟隨者頁運作，把「曾經追蹤過你、後來取消」的人記下來。資料只存在你自己的瀏覽器裡，不上傳、不公開、也不會自動做任何事。剛開始一定是 0，要持續開著頁面、讓腳本觀察一段時間才會有數字。',
-        listNoteOwn: '這是腳本「捲過就看過」的累計名單（只增不減，不會因為你往回捲就掉數字）。數字對不上時，把列表往下多捲幾段讓它掃完。點帳號可以直接開他的主頁。',
+        listNoteOwn: '這是腳本「捲過就看過」的累計名單（只增不減，不會因為你往回捲就掉數字）。數字對不上時，把列表往下多捲幾段讓它掃完。名單會顯示掃描當下抓到的顯示名稱，一眼就能認出是誰；點帳號可以直接開他的主頁。',
         listNoteOthers: '這是你在別人的列表上已經捲過的帳號。上面列出「關注了你」（值得你回關）與「你已追蹤」的人；跟你互不相干的不會列出來。',
         listEmpty: '目前還沒有資料。把列表往下捲，讓腳本掃過帳號就會累積進來。'
     };
@@ -95,6 +95,42 @@
     }
     function saveStore() {
         try { localStorage.setItem(STORE_KEY, JSON.stringify(store)); } catch (e) {}
+    }
+
+    // ---------- v6.11：顯示名稱快取（username → 顯示名） ----------
+    // 名單裡只放 @handle 沒人認得出來（大家看的是名字）。掃描時順手把 cell 上的顯示名記下來，
+    // 存在本地（只在本機），開啟名單時就能「顯示名 + @handle」並排。抓不到就只顯示 @handle。
+    const NAME_KEY = 'xufr_names_v1';
+    const nameStore = loadNames();
+    let nameDirty = false, nameFlushTimer = null;
+
+    function loadNames() {
+        try { return JSON.parse(localStorage.getItem(NAME_KEY) || '{}'); }
+        catch (e) { return {}; }
+    }
+    function flushNames() {
+        if (!nameDirty) return;
+        try { localStorage.setItem(NAME_KEY, JSON.stringify(nameStore)); } catch (e) {}
+        nameDirty = false;
+    }
+    // 寫入批次化：連續捲動時不會每列都打一次 localStorage
+    function rememberName(username, cell) {
+        if (!username) return;
+        const n = getName(cell, username);
+        if (!n || nameStore[username] === n) return;
+        nameStore[username] = n;   // 改名以最新觀測覆蓋
+        nameDirty = true;
+        if (!nameFlushTimer) {
+            nameFlushTimer = setTimeout(() => { nameFlushTimer = null; flushNames(); }, 3000);
+        }
+    }
+    function nameOf(username) { return nameStore[username] || ''; }
+
+    // 名單內容來自頁面，寫進 innerHTML 前一律轉義
+    function esc(t) {
+        return String(t == null ? '' : t)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
     }
     function todayStr() {
         const d = new Date();
@@ -277,7 +313,9 @@
     function closeListModal() { if (listModal) listModal.style.display = 'none'; }
 
     function rowsToText(rows) {
-        return rows.map(r => '@' + r.u + (r.note ? '  ' + r.note : '')).join('\n');
+        return rows.map(r =>
+            (r.n ? r.n + ' ' : '') + '@' + r.u + (r.note ? '  ' + r.note : '')
+        ).join('\n');
     }
 
     function openListModal() {
@@ -295,13 +333,23 @@
         }
 
         const rowsHtml = snap.rows.length
-            ? snap.rows.map(r =>
-                '<a href="https://x.com/' + r.u + '" target="_blank" rel="noopener noreferrer" ' +
-                'style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:7px 2px;' +
-                'border-bottom:1px solid rgba(255,255,255,.09);color:#fff;text-decoration:none">' +
-                '<span style="font-family:monospace;font-size:13px">@' + r.u + '</span>' +
-                '<span style="opacity:.6;font-size:11px;white-space:nowrap">' + (r.note || '') + '</span></a>').join('')
-            : '<div style="opacity:.75;padding:12px 2px;line-height:1.75;font-size:12px">' + snap.empty + '</div>';
+            ? snap.rows.map(r => {
+                // v6.11：顯示名放前面（大家認名字），@handle 縮小跟在後面；沒抓到名字就只顯示 @handle
+                const idHtml = r.n
+                    ? '<span style="display:flex;align-items:baseline;gap:6px;min-width:0;overflow:hidden">' +
+                        '<span style="font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;' +
+                        'text-overflow:ellipsis;color:#fff">' + esc(r.n) + '</span>' +
+                        '<span style="font-family:monospace;font-size:10.5px;opacity:.5;white-space:nowrap;flex:0 0 auto">@' +
+                        esc(r.u) + '</span>' +
+                      '</span>'
+                    : '<span style="font-family:monospace;font-size:13px">@' + esc(r.u) + '</span>';
+                return '<a href="https://x.com/' + esc(r.u) + '" target="_blank" rel="noopener noreferrer" ' +
+                    'style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:7px 2px;' +
+                    'border-bottom:1px solid rgba(255,255,255,.09);color:#fff;text-decoration:none">' +
+                    '<span style="flex:1 1 auto;min-width:0;display:flex">' + idHtml + '</span>' +
+                    '<span style="opacity:.6;font-size:11px;white-space:nowrap;flex:0 0 auto">' + esc(r.note || '') + '</span></a>';
+            }).join('')
+            : '<div style="opacity:.75;padding:12px 2px;line-height:1.75;font-size:12px">' + esc(snap.empty) + '</div>';
 
         listModal.innerHTML =
             '<div style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:min(520px,92vw);max-height:78vh;' +
@@ -342,7 +390,7 @@
         setSnapshot(
             i18n.unfLabel + i18n.listTitleSuffix + ' · ' + keys.length,
             i18n.unfNoteOpen,
-            keys.map(u => ({ u: u, note: unfLog[u] })),
+            keys.map(u => ({ u: u, n: nameOf(u), note: unfLog[u] })),
             i18n.unfNoteOpen
         );
         openListModal();
@@ -513,6 +561,32 @@
         if (parts.length < 2 || !parts[1]) return null;
         const u = parts[1].toLowerCase();
         return IGNORED_USERNAMES.has(u) ? null : u;
+    }
+
+    // ---------- v6.11：抓「顯示名稱」 ----------
+    // X 的 UserCell 內有 data-testid="User-Name"，裡面第一個 <span> 就是顯示名，後面才是 @handle。
+    // 主路徑取第一個 span（最準）；抓不到時退回 innerText，逐行跳過純 @handle 行。
+    // 抓不到就回空字串 → 名單只顯示 @handle，不影響任何既有功能。
+    function getName(cell, username) {
+        try {
+            const un = cell.querySelector('[data-testid="User-Name"]');
+            if (!un) return '';
+            const sp = un.querySelector('span');
+            if (sp) {
+                const t = (sp.textContent || '').replace(/\s+/g, ' ').trim();
+                if (t && t.charAt(0) !== '@') return t.slice(0, 40);
+            }
+            const raw = un.innerText || un.textContent || '';
+            if (!raw) return '';
+            const lines = raw.split(/[\n\r]+/).map(s => s.trim()).filter(Boolean);
+            for (let i = 0; i < lines.length; i++) {
+                let ln = lines[i];
+                if (/^@[A-Za-z0-9_]{1,15}$/.test(ln)) continue;   // 純 @handle 行 → 跳過
+                if (username) ln = ln.replace(new RegExp('@' + username + '\\b', 'ig'), ' ').trim();
+                if (ln) return ln.slice(0, 40);
+            }
+            return '';
+        } catch (e) { return ''; }
     }
 
     // ---------- v6.9：這是「誰的」列表？自己的 vs 別人的 ----------
@@ -733,6 +807,7 @@
         cells.forEach(cell => {
             const username = getUsername(cell);
             if (!username) return;
+            rememberName(username, cell);   // v6.11：順手記下顯示名（名單用）
 
             if (isFers) {
                 // v6.9：別人的跟隨者列表 → 換一套口徑（這裡的人本來就不是你的粉絲）
@@ -864,8 +939,8 @@
         if (isFers && !ownList) {
             // v6.10：同時準備可點開的名單（關注你的排前，你已追蹤的附在後）
             const oRows = [];
-            othersFY.forEach(u => oRows.push({ u: u, note: i18n.followsYouTag }));
-            othersTracked.forEach(u => { if (!othersFY.has(u)) oRows.push({ u: u, note: i18n.trackedByMe }); });
+            othersFY.forEach(u => oRows.push({ u: u, n: nameOf(u), note: i18n.followsYouTag }));
+            othersTracked.forEach(u => { if (!othersFY.has(u)) oRows.push({ u: u, n: nameOf(u), note: i18n.trackedByMe }); });
             setSnapshot(i18n.followsYou + i18n.listTitleSuffix + ' · ' + othersFY.size,
                 i18n.listNoteOthers, oRows, i18n.listEmpty);
             updateStats(i18n.followsYou, othersFY.size,
@@ -887,7 +962,7 @@
         const pendingRows = [];
         acc.forEach((v, u) => { if (v !== 1) pendingRows.push({ u: u, d: store[u] ? daysSince(store[u]) : 0 }); });
         pendingRows.sort((a, b) => b.d - a.d);
-        const rowsForModal = pendingRows.map(r => ({ u: r.u, note: fmtDays(r.d) }));
+        const rowsForModal = pendingRows.map(r => ({ u: r.u, n: nameOf(r.u), note: fmtDays(r.d) }));
         if (isFers) {
             const ex = sugSeen.size ? ' · ' + i18n.excluded + ' ' + sugSeen.size : '';
             setSnapshot(i18n.notBack + i18n.listTitleSuffix + ' · ' + pendingRows.length,
