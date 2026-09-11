@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GANSHA · X Mutual Radar
 // @namespace    http://tampermonkey.net/
-// @version      6.11
+// @version      6.13
 // @description  [GANSHA 互關雷達] X 追蹤名單增強：未回關／未回跟自動排到最前並加粉紅框、互關標綠、本地記錄誰偷偷取關你；右下角面板可點數字看完整名單。資料只存自己的瀏覽器，不公開、不上傳、不自動操作。安裝與排解見 repo 的 INSTALL.md。
 // @author       𝕏 @todaygansha
 // @updateURL    https://raw.githubusercontent.com/TODAYGANSHA/x-mutual-radar/main/GANSHA-Mutual-Radar.user.js
@@ -17,7 +17,7 @@
     'use strict';
 
     // 腳本版本：面板頁腳統一讀這裡，往後改版只要改這一行就不會漏
-    const SCRIPT_VER = '6.11';
+    const SCRIPT_VER = '6.13';
 
     // v6.9.1 啟動標記：一眼判斷「腳本到底有沒有被瀏覽器執行」。
     // 在 x.com 按 F12 → Console（主控台），看到這行＝腳本在跑；
@@ -360,6 +360,7 @@
                 '<div id="gansha-modal-close" style="cursor:pointer;opacity:.65;font-size:17px;line-height:1;padding:2px 7px">✕</div>' +
               '</div>' +
               (snap.note ? '<div style="opacity:.6;font-size:11px;margin-top:7px;line-height:1.7;flex:0 0 auto">' + snap.note + '</div>' : '') +
+              nameHintHtml() +
               '<div style="margin-top:10px;overflow:auto;flex:1 1 auto;min-height:44px">' + rowsHtml + '</div>' +
               '<div style="display:flex;gap:8px;margin-top:12px;justify-content:flex-end;flex:0 0 auto">' +
                 '<div id="gansha-modal-copy" style="cursor:pointer;padding:6px 13px;border:1px solid rgba(255,255,255,.3);' +
@@ -563,30 +564,71 @@
         return IGNORED_USERNAMES.has(u) ? null : u;
     }
 
-    // ---------- v6.11：抓「顯示名稱」 ----------
-    // X 的 UserCell 內有 data-testid="User-Name"，裡面第一個 <span> 就是顯示名，後面才是 @handle。
-    // 主路徑取第一個 span（最準）；抓不到時退回 innerText，逐行跳過純 @handle 行。
-    // 抓不到就回空字串 → 名單只顯示 @handle，不影響任何既有功能。
+    // ---------- v6.13：抓「顯示名稱」（修正 v6.12 仍抓不到） ----------
+    // v6.12 的 bug：cell.querySelector('a[href^="/"]') 抓到的是「頭像連結」（UserCell 裡第一個
+    // a[href^="/"] 就是頭像，裡面只有 <img>，textContent 為空）→ 主路徑抓空、退回 User-Name 備援也
+    // 抓空 → 名單只剩 @handle（這也解釋了為什麼「數字有、名字沒有」：getUsername 讀的是同一個連結的
+    // href 屬性，頭像連結的 href 有 /username，所以 handle 抓得到，但文字抓不到）。
+    // 本版：只挑「有文字」的主頁連結（頭像被自然排除），並優先 User-Name 內的 <a>。
     function getName(cell, username) {
         try {
-            const un = cell.querySelector('[data-testid="User-Name"]');
-            if (!un) return '';
-            const sp = un.querySelector('span');
-            if (sp) {
-                const t = (sp.textContent || '').replace(/\s+/g, ' ').trim();
-                if (t && t.charAt(0) !== '@') return t.slice(0, 40);
+            if (!cell) return '';
+            const cands = [];
+            const links = cell.querySelectorAll('a[href^="/"]');
+            const u = (username || '').toLowerCase();
+            // 1) 精確命中 username 且有文字的主頁連結（「顯示名」那個連結，非頭像）
+            for (const a of links) {
+                const h = (a.getAttribute('href') || '').replace(/\s+/g, '').replace(/^\//, '');
+                const txt = (a.textContent || '').replace(/\s+/g, '');
+                if (u && txt && h === u) { cands.unshift(a.textContent); break; }
             }
-            const raw = un.innerText || un.textContent || '';
-            if (!raw) return '';
-            const lines = raw.split(/[\n\r]+/).map(s => s.trim()).filter(Boolean);
-            for (let i = 0; i < lines.length; i++) {
-                let ln = lines[i];
-                if (/^@[A-Za-z0-9_]{1,15}$/.test(ln)) continue;   // 純 @handle 行 → 跳過
-                if (username) ln = ln.replace(new RegExp('@' + username + '\\b', 'ig'), ' ').trim();
-                if (ln) return ln.slice(0, 40);
+            const un = cell.querySelector('[data-testid="User-Name"]');
+            if (un) {
+                // 2) User-Name 內的連結（最穩：顯示名就在這個 a 的文字裡）
+                const unLink = un.querySelector('a');
+                if (unLink && (unLink.textContent || '').replace(/\s/g, '')) cands.push(unLink.textContent);
+                // 3) 其餘「有文字」的主頁連結（排除頭像）
+                for (const a of links) {
+                    const txt = (a.textContent || '').replace(/\s+/g, '');
+                    if (txt) cands.push(a.textContent);
+                }
+                // 4) User-Name 整塊文字（最後備援）
+                const t = (un.innerText || un.textContent || '').trim();
+                if (t) cands.push(t);
+            } else {
+                // 沒有 User-Name 時，直接從主頁連結挑有文字的那個
+                for (const a of links) {
+                    const txt = (a.textContent || '').replace(/\s+/g, '');
+                    if (txt) cands.push(a.textContent);
+                }
+            }
+
+            const NOISE = ['關注了你', 'follows you', '已認證', 'verified', '·', '•'];
+            for (let raw of cands) {
+                let t = (raw || '').replace(/\s+/g, ' ').trim();
+                if (!t) continue;
+                if (u) t = t.replace(new RegExp('@' + u + '\\b', 'ig'), ' ').trim();
+                const lines = t.split(/[\n\r]+/).map(s => s.trim()).filter(Boolean);
+                for (let ln of lines) {
+                    NOISE.forEach(w => { ln = ln.split(w).join(' '); });
+                    ln = ln.replace(/@[\w]{1,15}/ig, '').replace(/\s+/g, ' ').trim();
+                    if (!ln) continue;
+                    if (/^@[A-Za-z0-9_]{1,15}$/.test(ln)) continue;   // 純 handle → 跳過
+                    return ln.slice(0, 40);
+                }
             }
             return '';
         } catch (e) { return ''; }
+    }
+
+    // 診斷提示：名單開啟時若完全沒有顯示名快取，提示使用者「下滑掃描一下」
+    function nameHintHtml() {
+        if (Object.keys(nameStore).length) return '';
+        return '<div style="margin-top:8px;padding:8px 10px;border-radius:8px;' +
+            'background:rgba(224,36,94,.14);border:1px solid rgba(224,36,94,.4);' +
+            'color:#ffd0dd;font-size:11.5px;line-height:1.6;flex:0 0 auto">' +
+            '⚠️ 暫無顯示名資料：把列表往下滑一大段（讓腳本掃描到帳號），再開這份名單就會帶名字。' +
+            '若滑動後仍空白，請回報（附 F12 複製的一個使用者區塊 HTML）。</div>';
     }
 
     // ---------- v6.9：這是「誰的」列表？自己的 vs 別人的 ----------
