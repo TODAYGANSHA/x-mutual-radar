@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GANSHA · X Mutual Radar
 // @namespace    http://tampermonkey.net/
-// @version      6.13
+// @version      6.15
 // @description  [GANSHA 互關雷達] X 追蹤名單增強：未回關／未回跟自動排到最前並加粉紅框、互關標綠、本地記錄誰偷偷取關你；右下角面板可點數字看完整名單。資料只存自己的瀏覽器，不公開、不上傳、不自動操作。安裝與排解見 repo 的 INSTALL.md。
 // @author       𝕏 @todaygansha
 // @updateURL    https://raw.githubusercontent.com/TODAYGANSHA/x-mutual-radar/main/GANSHA-Mutual-Radar.user.js
@@ -17,7 +17,7 @@
     'use strict';
 
     // 腳本版本：面板頁腳統一讀這裡，往後改版只要改這一行就不會漏
-    const SCRIPT_VER = '6.13';
+    const SCRIPT_VER = '6.15';
 
     // v6.9.1 啟動標記：一眼判斷「腳本到底有沒有被瀏覽器執行」。
     // 在 x.com 按 F12 → Console（主控台），看到這行＝腳本在跑；
@@ -64,6 +64,13 @@
         unfWatching: '還在觀察中',
         unfTip: '本地取關偵測：記錄「曾追蹤你、後來取消」的帳號。只存在你自己的瀏覽器，不上傳、不公開。剛開始一定是 0，要累積一段時間才會有數字。',
         unfNoteOpen: '這是「本地取關偵測」的紀錄。腳本只在你自己的跟隨者頁運作，把「曾經追蹤過你、後來取消」的人記下來。資料只存在你自己的瀏覽器裡，不上傳、不公開、也不會自動做任何事。剛開始一定是 0，要持續開著頁面、讓腳本觀察一段時間才會有數字。',
+        // v6.14：我主動取關過的帳號（避免重複關注同一個不回關的人）
+        iunfPast: '你取關過',
+        iunfLabel: '我取關過',
+        iunfCopy: '點此看名單',
+        iunfWatching: '點取消追蹤才會記',
+        iunfTip: '本地記錄：你在本機手動「取消追蹤」過的帳號。只存在你自己的瀏覽器，不上傳、不公開。再看到他時會標「你取關過」，提醒你別又跟回去。',
+        iunfNoteOpen: '這是「我主動取關過」的本地記錄。每當你在 X 上點擊「取消追蹤」，腳本就把那個帳號記下來；之後他在任何列表出現都會標「你取關過」，幫你避開「又手滑跟回去」的人。資料只存在你自己的瀏覽器，不上傳、不公開、不做任何自動操作。',
         listNoteOwn: '這是腳本「捲過就看過」的累計名單（只增不減，不會因為你往回捲就掉數字）。數字對不上時，把列表往下多捲幾段讓它掃完。名單會顯示掃描當下抓到的顯示名稱，一眼就能認出是誰；點帳號可以直接開他的主頁。',
         listNoteOthers: '這是你在別人的列表上已經捲過的帳號。上面列出「關注了你」（值得你回關）與「你已追蹤」的人；跟你互不相干的不會列出來。',
         listEmpty: '目前還沒有資料。把列表往下捲，讓腳本掃過帳號就會累積進來。'
@@ -217,6 +224,24 @@
     }
 
     function unfCount() { return Object.keys(unfLog).length; }
+
+    // v6.14：我主動取關過的帳號（避免重複關注同一個不回關的人）
+    const IUNF_KEY = 'xufr_i_unfollowed_v1';   // username -> 'YYYY-MM-DD'（我手動取消追蹤的日期）
+    let iUnfLog = loadIUnfLog();
+    function loadIUnfLog() {
+        try { return JSON.parse(localStorage.getItem(IUNF_KEY) || '{}'); }
+        catch (e) { return {}; }
+    }
+    function saveIUnfLog() {
+        try { localStorage.setItem(IUNF_KEY, JSON.stringify(iUnfLog)); } catch (e) {}
+    }
+    // 記下「我曾取關過他」＋ 順手清掉首監測日（修 Bug1：取關後不再保留舊天數，再追時從 0 算起）
+    function recordMyUnfollow(username) {
+        if (!username) return;
+        iUnfLog[username] = todayStr();
+        saveIUnfLog();
+        if (store[username]) { delete store[username]; saveStore(); }
+    }
 
     // 匯出：純本地名單，複製到剪貼簿（自己保存用，不公開、不上傳）
     function exportUnfollowers() {
@@ -564,6 +589,20 @@
         return IGNORED_USERNAMES.has(u) ? null : u;
     }
 
+    // v6.14b：從網址取 username（主頁 / 推文頁取消追蹤，按鈕不在 UserCell 裡時用）
+    // 例：x.com/alice、x.com/alice/status/123 → 'alice'；保留路由（home/explore...）回 null
+    function getUsernameFromPage() {
+        try {
+            const seg = (location.pathname || '').split('/').filter(Boolean);
+            const u = seg[0];
+            if (!u) return null;
+            const reserved = ['home', 'explore', 'notifications', 'messages', 'i',
+                'settings', 'search', 'compose', 'bookmarks', 'lists', 'hashtag'];
+            if (reserved.indexOf(u.toLowerCase()) >= 0) return null;
+            return u.toLowerCase();
+        } catch (e) { return null; }
+    }
+
     // ---------- v6.13：抓「顯示名稱」（修正 v6.12 仍抓不到） ----------
     // v6.12 的 bug：cell.querySelector('a[href^="/"]') 抓到的是「頭像連結」（UserCell 裡第一個
     // a[href^="/"] 就是頭像，裡面只有 <img>，textContent 為空）→ 主路徑抓空、退回 User-Name 備援也
@@ -718,6 +757,40 @@
         if (!inserted) cell.appendChild(badge);
     }
 
+    // v6.16：個人主頁標識「你曾取關過」。
+    // 你（用戶）的安全操作習慣是「進主頁再點取消」，取消後該帳號已不在追蹤列表，
+    // 列表徽章永遠貼不到 → 所以改在主頁本身貼橫幅，讓你在「要不要又跟回去」的當下就看見。
+    // 只處理單段路徑的個人主頁（x.com/alice），不含推文/狀態頁；保留路由由 getUsernameFromPage 擋掉。
+    function applyProfileBanner() {
+        const primary = document.querySelector('[data-testid="primaryColumn"]') || document.querySelector('main');
+        if (!primary) return;
+        // v6.18：清掉多餘的重複橫幅（X 重渲染可能造成兩顆並存），只留第一顆
+        const all = document.querySelectorAll ? document.querySelectorAll('#gansha-iunf-banner') : [];
+        for (let i = 1; i < all.length; i++) all[i].remove();
+        const existing = all[0];
+        const seg = (location.pathname || '').split('/').filter(Boolean);
+        if (seg.length !== 1) { if (existing) existing.remove(); return; }   // 非個人主頁 → 清掉舊橫幅
+        const u = getUsernameFromPage();
+        const d = u ? iUnfLog[u] : null;
+        if (!d) { if (existing) existing.remove(); return; }                 // 不在清單 → 清掉舊橫幅
+        if (existing) return;                                               // 已貼 → 不重複
+        const pf = d.split('-');
+        const md = pf.length === 3 ? (+pf[1]) + '/' + (+pf[2]) : d;
+        const banner = document.createElement('div');
+        banner.id = 'gansha-iunf-banner';
+        banner.setAttribute('data-gansha', '1');
+        banner.style.cssText = 'display:inline-flex;align-items:center;margin-left:10px;padding:3px 10px;border-radius:999px;font-size:13px;'
+            + 'font-weight:600;color:#b45309;border:1px solid #f59e0b;background:#fffbeb;vertical-align:middle;white-space:nowrap;max-width:fit-content;';
+        banner.textContent = '提醒：你曾在 ' + md + ' 取關過 @' + u;
+        // v6.15c：只貼在「顯示名稱」那一列（名字＋認證章右側、bio 上方）。
+        // 不設任何 fallback——名字區塊還沒載出來就先不貼，等下一輪掃描再試，
+        // 寧可晚一秒出現，也絕不出現在錯的位置（置頂上方那種慘案就是 fallback 造成的）。
+        const nameBox = primary.querySelector('[data-testid="UserName"]');
+        const nameRow = nameBox ? (nameBox.querySelector('div') || nameBox) : null;
+        if (!nameRow) { if (existing) existing.remove(); return; }   // 名字列還沒載出來 → 拆掉等下一輪
+        nameRow.appendChild(banner);
+    }
+
     // 狀態標籤：notback=未回關(粉紅) / mutual=互關(綠) / backed=已回跟(綠) / notbacked=未回跟(灰)
     function makeTag(kind, days) {
         const b = document.createElement('div');
@@ -736,6 +809,10 @@
             // 第二參數作模式用：'new' = 本次剛偵測到；其餘為日期字串（M/D）
             txt = (days === 'new') ? i18n.unfNew : (i18n.unfPast + ' · ' + (days || ''));
             css = 'color: #fff; border: 1px solid #e0245e; background: #e0245e;';
+        } else if (kind === 'iunf') {
+            // v6.14：你曾主動取關過他（提醒別又跟回去）。琥珀色，和「他取關你」(粉紅實心) 區分
+            txt = i18n.iunfPast + (days ? ' · ' + days : '');
+            css = 'color: #b45309; border: 1px solid #f59e0b; background: #fffbeb;';
         } else if (kind === 'mutual') {
             txt = '互關';
             css = 'color: #00a06a; border: 1px solid #7fe0c0; background: #f0fbf6;';
@@ -804,6 +881,7 @@
 
     // ---------- 主掃描（每 1.2s）：累計 + 視覺標記 ----------
     function scanDOM() {
+        applyProfileBanner();   // v6.16：主頁標識（任何頁都跑，內部判斷是否為個人主頁）
         const p = window.location.pathname;
         const isFol = p.endsWith('/following');
         const isFers = p.endsWith('/followers');
@@ -871,7 +949,7 @@
                     else if (mode === 'o_fy') appendBadge(cell, username, makeTag('followsyou'));
                     else if (mode === 'o_tracked') appendBadge(cell, username, makeTag('tracked'));
                     // o_none：沒追你、你也没追 → 完全不標。你就是來找這種人的，標了只是噪音。
-                    return;
+                                        return;
                 }
                 // v6.8：推薦／建議帳號（根本沒追你）→ 不打紅框、不算未回跟、只標灰徽章
                 if (isSuggestedEntry(cell)) {
@@ -918,7 +996,7 @@
                         const mdF = pf.length === 3 ? (+pf[1]) + '/' + (+pf[2]) : unfDateF;
                         appendBadge(cell, username, makeTag('unf', mdF));
                     }
-                    return;
+                                        return;
                 }
 
                 // 未回跟 → 紅框圈起來（與 following 頁未回關同款視覺語言）
@@ -930,7 +1008,7 @@
                 } else {
                     appendBadge(cell, username, makeTag('notbacked'));
                 }
-                return;
+                                return;
             }
 
             // ----- following 頁：未回關雷達（每列都標狀態） -----
@@ -960,12 +1038,12 @@
                 const pp = unfDate.split('-');
                 const mdTxt = pp.length === 3 ? (+pp[1]) + '/' + (+pp[2]) : unfDate;
                 appendBadge(cell, username, makeTag('unf', unfEvt === 'new' ? 'new' : mdTxt));
-                return;
+                                return;
             }
 
             if (isFollowedBy) {
                 appendBadge(cell, username, makeTag('mutual'));
-                return;
+                                return;
             }
 
             if (!store[username]) {
@@ -974,7 +1052,7 @@
             }
             frameCell(cell, false);
             appendBadge(cell, username, makeTag('notback', daysSince(store[username])));
-        });
+                    });
 
         // 統計：以不重複累計為準（只增不減；分類以最新狀態覆蓋）
         // v6.9：別人的跟隨者列表 → 改以「他有沒有追你」為主統計，不看未回跟
@@ -1042,6 +1120,40 @@
         if (!user) return;
         pendingBlocks.set(user, Date.now() + 15000);
     }, true);
+
+    // v6.14：攔截「取消追蹤」按鈕 → 記錄「我曾取關過他」。純本機、零請求；
+    // 只在按鈕真的從 Following 變 Follow（或整格消失）才記，確保零誤報。
+    let unfWatchReady = false;
+    function ensureUnfollowWatcher() {
+        if (unfWatchReady) return;
+        unfWatchReady = true;
+        document.addEventListener('click', (ev) => {
+            const el = ev.target;
+            if (!el || !el.closest) return;
+            const btn = el.closest('[data-testid$="-unfollow"]');
+            if (!btn) return;
+            const cell = btn.closest('[data-testid="UserCell"]');
+            let username = cell ? getUsername(cell) : null;
+            if (!username) username = getUsernameFromPage();   // 主頁/推文頁取消：從網址取
+            if (!username) return;
+            let done = false;
+            [1200, 2600, 4200, 7000, 11000, 16000].forEach(delay => setTimeout(() => {
+                if (done) return;
+                const curCell = btn.closest('[data-testid="UserCell"]');
+                const curUser = curCell ? getUsername(curCell) : null;
+                // 虛擬列表把這格複用完給別人 → 放棄，避免記錯人（零誤報優先）
+                if (curCell && curUser && curUser !== username) { done = true; return; }
+                // 主頁場景無 UserCell：網址仍指向同一人表示動作未完成；若已跳到別人主頁則放棄
+                const pageU = getUsernameFromPage();
+                if (!curCell && pageU && pageU !== username) { done = true; return; }
+                const tt = btn.getAttribute('data-testid');
+                if (!tt || !tt.endsWith('-unfollow')) { done = true; recordMyUnfollow(username); }
+            }, delay));
+            // 安全網：18s 後停觀察，避免一直掛著
+            setTimeout(() => { done = true; }, 18000);
+        }, true);
+    }
+    ensureUnfollowWatcher();
 
     setInterval(scanDOM, 1200);
 })();
