@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GANSHA · X Mutual Radar
 // @namespace    http://tampermonkey.net/
-// @version      6.15
+// @version      6.17
 // @description  [GANSHA 互關雷達] X 追蹤名單增強：未回關／未回跟自動排到最前並加粉紅框、互關標綠、本地記錄誰偷偷取關你；右下角面板可點數字看完整名單。資料只存自己的瀏覽器，不公開、不上傳、不自動操作。安裝與排解見 repo 的 INSTALL.md。
 // @author       𝕏 @todaygansha
 // @updateURL    https://raw.githubusercontent.com/TODAYGANSHA/x-mutual-radar/main/GANSHA-Mutual-Radar.user.js
@@ -17,7 +17,7 @@
     'use strict';
 
     // 腳本版本：面板頁腳統一讀這裡，往後改版只要改這一行就不會漏
-    const SCRIPT_VER = '6.15';
+    const SCRIPT_VER = '6.17';
 
     // v6.9.1 啟動標記：一眼判斷「腳本到底有沒有被瀏覽器執行」。
     // 在 x.com 按 F12 → Console（主控台），看到這行＝腳本在跑；
@@ -238,10 +238,23 @@
     // 記下「我曾取關過他」＋ 順手清掉首監測日（修 Bug1：取關後不再保留舊天數，再追時從 0 算起）
     function recordMyUnfollow(username) {
         if (!username) return;
+        const me = (myHandle() || '').toLowerCase();
+        if (me && username.toLowerCase() === me) return;   // v6.15d：絕不記錄自己的帳號
         iUnfLog[username] = todayStr();
         saveIUnfLog();
         if (store[username]) { delete store[username]; saveStore(); }
     }
+
+    // v6.17：啟動即自清「自己」殘留。早期版本曾把登入帳號本身誤寫進 iUnfLog
+    // （導致自己主頁顯示「取關過自己」）。腳本啟動時主動把紀錄裡的自己刪掉，
+    // 不須等到逛自己主頁才清；myHandle 還沒抓到時最多重試幾次。
+    let selfPurgeTries = 0;
+    function purgeSelfIUnf() {
+        const me = (myHandle() || '').toLowerCase();
+        if (!me) { if (selfPurgeTries++ < 6) setTimeout(purgeSelfIUnf, 2000); return; }
+        if (iUnfLog[me]) { delete iUnfLog[me]; saveIUnfLog(); }
+    }
+    purgeSelfIUnf();
 
     // 匯出：純本地名單，複製到剪貼簿（自己保存用，不公開、不上傳）
     function exportUnfollowers() {
@@ -771,7 +784,16 @@
         const seg = (location.pathname || '').split('/').filter(Boolean);
         if (seg.length !== 1) { if (existing) existing.remove(); return; }   // 非個人主頁 → 清掉舊橫幅
         const u = getUsernameFromPage();
-        const d = u ? iUnfLog[u] : null;
+        if (!u) { if (existing) existing.remove(); return; }
+        // v6.15d：自己的主頁絕不顯示「取關過自己」——這是 bug（自己的 handle 曾被誤寫入紀錄）。
+        // 這裡直接擋掉顯示，並順手把紀錄裡的自己清掉，避免下次又冒出來。
+        const me = (myHandle() || '').toLowerCase();
+        if (me && u === me) {
+            if (iUnfLog[u]) { delete iUnfLog[u]; saveIUnfLog(); }
+            if (existing) existing.remove();
+            return;
+        }
+        const d = iUnfLog[u];
         if (!d) { if (existing) existing.remove(); return; }                 // 不在清單 → 清掉舊橫幅
         if (existing) return;                                               // 已貼 → 不重複
         const pf = d.split('-');
@@ -782,6 +804,23 @@
         banner.style.cssText = 'display:inline-flex;align-items:center;margin-left:10px;padding:3px 10px;border-radius:999px;font-size:13px;'
             + 'font-weight:600;color:#b45309;border:1px solid #f59e0b;background:#fffbeb;vertical-align:middle;white-space:nowrap;max-width:fit-content;';
         banner.textContent = '提醒：你曾在 ' + md + ' 取關過 @' + u;
+        // v6.17：提醒旁加「清除」開關——點一下直接把這筆從「我取關過」名單刪掉，並移除橫幅。
+        // 純本機操作，不上傳、不影響其他人的紀錄。
+        const clearBtn = document.createElement('span');
+        clearBtn.textContent = '✕ 清除';
+        clearBtn.setAttribute('role', 'button');
+        clearBtn.setAttribute('title', '把這筆「我取關過」紀錄清除（只刪這個帳號）');
+        clearBtn.style.cssText = 'margin-left:8px;padding-left:8px;border-left:1px solid #fcd34d;cursor:pointer;'
+            + 'color:#9a3412;font-size:12px;font-weight:500;opacity:.85;user-select:none;';
+        clearBtn.addEventListener('mouseenter', () => { clearBtn.style.opacity = '1'; });
+        clearBtn.addEventListener('mouseleave', () => { clearBtn.style.opacity = '.85'; });
+        clearBtn.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            if (iUnfLog[u]) { delete iUnfLog[u]; saveIUnfLog(); }
+            banner.remove();
+        });
+        banner.appendChild(clearBtn);
         // v6.15c：只貼在「顯示名稱」那一列（名字＋認證章右側、bio 上方）。
         // 不設任何 fallback——名字區塊還沒載出來就先不貼，等下一輪掃描再試，
         // 寧可晚一秒出現，也絕不出現在錯的位置（置頂上方那種慘案就是 fallback 造成的）。
